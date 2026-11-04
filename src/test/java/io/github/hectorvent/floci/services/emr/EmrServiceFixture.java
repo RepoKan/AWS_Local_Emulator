@@ -15,6 +15,7 @@ import io.github.hectorvent.floci.testing.MutableClock;
 import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
+import java.util.Arrays;
 import java.util.List;
 import java.util.Optional;
 import java.util.Set;
@@ -53,7 +54,14 @@ final class EmrServiceFixture {
      * {@link #whileCreating} run as each is made.
      */
     static final class RecordingStorage implements ClusterStorage {
+        // The address each cluster's HDFS answers at.
+        static final String HDFS_ADDRESS = "172.18.0.5";
+        // The Docker network of a cluster's own each cluster's HDFS is on.
+        static final String HDFS_NETWORK = "floci-aws-emr-hdfs";
         final List<String> created = new ArrayList<>();
+        // Each HDFS started: its cluster, primary node's host name, image and Docker network.
+        final List<List<String>> hdfs = new ArrayList<>();
+        RuntimeException hdfsFailure;
         final List<String> removed = new ArrayList<>();
         final List<Set<String>> kept = new ArrayList<>();
         boolean refuse;
@@ -68,6 +76,16 @@ final class EmrServiceFixture {
         public void create(String clusterId, String accountId, String region) {
             created.add(clusterId);
             whileCreating.run();
+        }
+
+        @Override
+        public SparkJobRunner.Storage hdfs(String clusterId, String accountId, String region, String host,
+                                           String image, String dockerNetwork) {
+            hdfs.add(Arrays.asList(clusterId, host, image, dockerNetwork));
+            if (hdfsFailure != null) {
+                throw hdfsFailure;
+            }
+            return volumes(clusterId).withHdfs(host, HDFS_ADDRESS, HDFS_NETWORK);
         }
 
         @Override

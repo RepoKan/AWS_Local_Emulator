@@ -98,6 +98,10 @@ public class EmrService implements Resettable, StoredResourceArns {
             "On the master instance (%s), bootstrap action %d could not be read from %s: %s";
     private static final String BOOTSTRAP_NOT_RUN = "Floci could not run the bootstrap actions: %s";
     static final String BOOTSTRAP_INTERRUPTED = "Floci stopped while the cluster's bootstrap actions were running.";
+    // The release whose EMR Serverless Hive image runs the HDFS of a cluster of the AWS runtime for Apache Spark,
+    // which publishes none. Hadoop keeps its wire protocols compatible across a major version's minor releases, so
+    // a newer client, such as the runtime's, reaches its NameNode.
+    static final String SPARK_RUNTIME_HDFS_RELEASE = "emr-7.5.0";
 
     private final AccountAwareStorageBackend<EmrCluster> clusterStore;
     private final StorageBackend<String, SecurityConfiguration> secConfigStore;
@@ -1427,6 +1431,13 @@ public class EmrService implements Resettable, StoredResourceArns {
             // which the step's thread makes, or the release's.
             String image = cluster.getBootstrapImage() != null ? cluster.getBootstrapImage() : imageTemplate;
             Supplier<String> releaseImage = cluster.getBootstrapImage() == null ? releaseImage(cluster) : null;
+            // Every EMR cluster runs HDFS on its primary node, which the step's thread starts when it is not running:
+            // a NameNode and a DataNode, in a container of the release's Hive image, the one with HDFS's daemons.
+            String clusterId = cluster.getId();
+            String hdfsHost = masterPrivateDnsName(cluster);
+            String hdfsImage = hdfsImage(cluster.getReleaseLabel());
+            Supplier<SparkJobRunner.Storage> hdfs = storage == null ? null
+                    : () -> clusterStorage.hdfs(clusterId, accountId, region, hdfsHost, hdfsImage, dockerNetwork);
             SparkJobRunner.Job job;
             if (hive != null) {
                 job = new SparkJobRunner.Job(SERVICE, step.getId(), accountId, region, cluster.getReleaseLabel(),
@@ -1453,7 +1464,7 @@ public class EmrService implements Resettable, StoredResourceArns {
             }
             StepLaunch launch = new StepLaunch(accountId, region, cluster.getId(), step.getId(), generation);
             executing.add(stepKey(accountId, step.getId()));
-            stepExecutor.execute(() -> runStep(job, launch, releaseImage));
+            stepExecutor.execute(() -> runStep(job, launch, releaseImage, hdfs));
         }
 
         @Override
@@ -1464,7 +1475,8 @@ public class EmrService implements Resettable, StoredResourceArns {
 
     // A step's thread: its driver runs to its end, or the step fails at once when Floci does not run its kind. A
     // cluster with Hive's image is made first, when it is not there yet, so a failure to make it fails the step.
-    private void runStep(SparkJobRunner.Job job, StepLaunch launch, Supplier<String> releaseImage) {
+    private void runStep(SparkJobRunner.Job job, StepLaunch launch, Supplier<String> releaseImage,
+                         Supplier<SparkJobRunner.Storage> hdfs) {
         String failure;
         if (job == null) {
             failure = EmrSparkSteps.NOT_RUN;
@@ -1474,12 +1486,16 @@ public class EmrService implements Resettable, StoredResourceArns {
             try {
                 SparkJobRunner.Job running = releaseImage != null && !progress.cancelled()
                         ? job.inImage(releaseImage.get()) : job;
-                // The cluster's storage is there before its first step's container mounts it. A step a cancel,
-                // its cluster's end or a reset has passed does not start, so it makes none.
+                // The cluster's storage is there, its HDFS running, before its first step's container mounts it. A step
+                // a cancel, its cluster's end or a reset has passed does not start, so it makes none.
                 if (job.storage() != null && !progress.cancelled()) {
                     clusterStorage.create(launch.clusterId(), launch.accountId(), launch.region());
+                    running = running.onStorage(hdfs.get());
                 }
                 outcome = sparkRunner.run(running, progress);
+            } catch (ClusterStorage.Stopped e) {
+                // The teardown stopped its HDFS before its driver started, as it would have stopped the driver.
+                outcome = SparkJobRunner.Outcome.halted();
             } catch (RuntimeException e) {
                 LOG.warnv(e, "EMR step {0} could not run", launch.stepId());
                 outcome = SparkJobRunner.Outcome.couldNotStart(e.getMessage());
@@ -1541,6 +1557,16 @@ public class EmrService implements Resettable, StoredResourceArns {
         String spark = EmrServerlessSparkRunner.image(imageTemplate, release);
         String hive = EmrServerlessSparkRunner.image(hiveImageTemplate, release, SparkJobRunner.Engine.HIVE);
         return () -> releaseImages.image(release, spark, hive);
+    }
+
+    /**
+     * The image a cluster runs its HDFS in: its release's EMR Serverless Hive image, which has HDFS's daemons, or, for
+     * a release of the AWS runtime for Apache Spark, which has no Hive image, {@link #SPARK_RUNTIME_HDFS_RELEASE}'s.
+     */
+    private String hdfsImage(String releaseLabel) {
+        String release = EmrServerlessSparkRunner.sparkRuntime(releaseLabel) ? SPARK_RUNTIME_HDFS_RELEASE
+                : releaseLabel;
+        return EmrServerlessSparkRunner.image(hiveImageTemplate, release, SparkJobRunner.Engine.HIVE);
     }
 
     // A cluster's BootstrapActionConfig list, as RunJobFlow stored it once it had checked it.
@@ -1638,16 +1664,30 @@ public class EmrService implements Resettable, StoredResourceArns {
         return "i-" + String.format("%017d", index);
     }
 
+    /** The private IPv4 address ListInstances gives a cluster's instance {@code index}, counted from 1. */
+    static String privateIpAddress(int index) {
+        return "10.0.0." + index;
+    }
+
     // The primary instance's: the first of the MASTER group in the order ListInstances lists them.
     static String masterInstanceId(EmrCluster cluster) {
+        return ec2InstanceId(masterInstanceIndex(cluster));
+    }
+
+    // The primary instance's private DNS name, as ListInstances gives it, which names the cluster's HDFS.
+    static String masterPrivateDnsName(EmrCluster cluster) {
+        return AwsRegions.ec2PrivateIpDnsName(privateIpAddress(masterInstanceIndex(cluster)), cluster.getRegion());
+    }
+
+    private static int masterInstanceIndex(EmrCluster cluster) {
         int index = 1;
         for (EmrInstanceGroup group : cluster.getInstanceGroups()) {
             if ("MASTER".equals(group.getInstanceGroupType())) {
-                return ec2InstanceId(index);
+                return index;
             }
             index += group.getRunningInstanceCount();
         }
-        return ec2InstanceId(1);
+        return 1;
     }
 
     /** What a step's thread asks the service while its driver goes: a step has no timeout to report. */

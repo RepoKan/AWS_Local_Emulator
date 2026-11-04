@@ -19,8 +19,17 @@ public interface ClusterStorage {
     void create(String clusterId, String accountId, String region);
 
     /**
-     * Removes the volumes of {@code clusterId}'s storage once it no longer needs them: true when they are gone,
-     * false when Docker refused, so the caller can try again.
+     * Starts {@code clusterId}'s HDFS, a NameNode and a DataNode keeping their data in a volume of their own, in a
+     * container of {@code image} on the Docker network its steps run on, unless it is running, and returns the
+     * cluster's storage with it: its primary node's {@code host} name, which a step's container resolves to the
+     * address given. A failure to start it is thrown.
+     */
+    SparkJobRunner.Storage hdfs(String clusterId, String accountId, String region, String host, String image,
+                                String dockerNetwork);
+
+    /**
+     * Removes {@code clusterId}'s HDFS and the volumes of its storage once it no longer needs them: true when the
+     * volumes are gone, false when Docker refused, so the caller can try again.
      */
     boolean remove(String clusterId);
 
@@ -29,4 +38,12 @@ public interface ClusterStorage {
      * restart, the storage of the clusters that are gone or have ended, and on a reset all of it.
      */
     void removeAllBut(Set<String> kept);
+
+    /** A reset's or a shutdown's teardown stopped a cluster's HDFS while a step was waiting for it. */
+    final class Stopped extends RuntimeException {
+
+        public Stopped(String message) {
+            super(message);
+        }
+    }
 }

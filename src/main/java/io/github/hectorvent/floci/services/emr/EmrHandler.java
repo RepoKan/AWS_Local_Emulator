@@ -749,7 +749,7 @@ public class EmrHandler {
         node.put("Id", "ci-" + index + cluster.getId());
         node.put("Ec2InstanceId", EmrService.ec2InstanceId(index));
         node.put("PublicDnsName", AwsEndpoints.ec2PublicDns("203.0.113." + index, cluster.getRegion()));
-        String privateIp = "10.0.0." + index;
+        String privateIp = EmrService.privateIpAddress(index);
         node.put("PrivateDnsName", AwsRegions.ec2PrivateIpDnsName(privateIp, cluster.getRegion()));
         node.put("PrivateIpAddress", privateIp);
         node.put("InstanceGroupId", group.getId());
